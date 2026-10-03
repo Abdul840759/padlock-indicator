@@ -1,4 +1,4 @@
 <resources>
     <string name="app_name">Padlock Indicator</string>
-    <string name="service_description">Draws a small padlock at the top of the lock screen and animates it open when you unlock. It does not read your screen.</string>
+    <string name="service_description">Draws a small padlock and unlock animation at the top of the lock screen. It does not read your screen.</string>
 </resources>

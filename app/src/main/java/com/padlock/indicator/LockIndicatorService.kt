@@ -1,9 +1,13 @@
 package com.padlock.indicator
 
 import android.accessibilityservice.AccessibilityService
-import android.animation.ValueAnimator
 import android.app.KeyguardManager
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.admin.DevicePolicyManager
 import android.content.BroadcastReceiver
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -11,19 +15,23 @@ import android.graphics.PixelFormat
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import android.util.Log
 import android.view.Gravity
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
-import android.view.animation.OvershootInterpolator
 
 class LockIndicatorService : AccessibilityService() {
 
     private lateinit var wm: WindowManager
     private lateinit var km: KeyguardManager
+    private lateinit var dpm: DevicePolicyManager
+    private val adminName by lazy { ComponentName(this, LockDeviceAdmin::class.java) }
     private val handler = Handler(Looper.getMainLooper())
 
-    private var lockView: LockView? = null
+    private var pill: LockPillView? = null
     private var unlocking = false
+    private var registered = false
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -38,16 +46,22 @@ class LockIndicatorService : AccessibilityService() {
     override fun onServiceConnected() {
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         km = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+        dpm = getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
 
-        val filter = IntentFilter().apply {
-            addAction(Intent.ACTION_SCREEN_ON)
-            addAction(Intent.ACTION_SCREEN_OFF)
-            addAction(Intent.ACTION_USER_PRESENT)
-        }
-        if (Build.VERSION.SDK_INT >= 33) {
-            registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        } else {
-            registerReceiver(receiver, filter)
+        goForeground()
+
+        if (!registered) {
+            val filter = IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_ON)
+                addAction(Intent.ACTION_SCREEN_OFF)
+                addAction(Intent.ACTION_USER_PRESENT)
+            }
+            if (Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                registerReceiver(receiver, filter)
+            }
+            registered = true
         }
 
         if (km.isKeyguardLocked) showLock()
@@ -58,12 +72,31 @@ class LockIndicatorService : AccessibilityService() {
     override fun onInterrupt() {}
 
     override fun onDestroy() {
-        try {
-            unregisterReceiver(receiver)
-        } catch (_: Exception) {
+        if (registered) {
+            try {
+                unregisterReceiver(receiver)
+            } catch (_: Exception) {
+            }
+            registered = false
         }
         removeLock()
         super.onDestroy()
+    }
+
+    private fun goForeground() {
+        try {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.createNotificationChannel(
+                NotificationChannel(CHANNEL_ID, "Padlock Indicator", NotificationManager.IMPORTANCE_MIN)
+            )
+            val n = Notification.Builder(this, CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.ic_lock_lock)
+                .setContentTitle("Padlock Indicator is running")
+                .setOngoing(true)
+                .build()
+            startForeground(1, n)
+        } catch (_: Exception) {
+        }
     }
 
     @Suppress("DEPRECATION")
@@ -71,10 +104,10 @@ class LockIndicatorService : AccessibilityService() {
         handler.removeCallbacksAndMessages(null)
         unlocking = false
 
-        lockView?.let {
+        pill?.let {
             it.animate().cancel()
             it.alpha = 1f
-            it.openProgress = 0f
+            it.play(LockPillView.Mode.IDLE)
             return
         }
 
@@ -93,48 +126,60 @@ class LockIndicatorService : AccessibilityService() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-            y = statusBar + (4 * density).toInt()
+            y = statusBar + (2 * density).toInt()
         }
 
-        val view = LockView(this)
+        val view = LockPillView(this)
         try {
             wm.addView(view, params)
-            lockView = view
+            pill = view
+            view.play(LockPillView.Mode.IDLE)
         } catch (_: Exception) {
         }
     }
 
     private fun playUnlock() {
-        val view = lockView ?: return
+        val v = pill ?: return
         if (unlocking) return
         unlocking = true
 
-        ValueAnimator.ofFloat(0f, 1f).apply {
-            duration = 450
-            interpolator = OvershootInterpolator(1.2f)
-            addUpdateListener { view.openProgress = it.animatedValue as Float }
-            start()
+        val adminOn = dpm.isAdminActive(adminName)
+        val viaPassword = adminOn &&
+            SystemClock.elapsedRealtime() - UnlockInfo.lastPasswordAt < 4000L
+        val mode = if (adminOn && !viaPassword) {
+            LockPillView.Mode.UNLOCK_BIO
+        } else {
+            LockPillView.Mode.UNLOCK_PIN
         }
+        Log.d("Padlock", "unlock: admin=$adminOn password=$viaPassword mode=$mode")
 
-        handler.postDelayed({
-            view.animate()
-                .alpha(0f)
-                .setDuration(200)
-                .withEndAction { removeLock() }
-                .start()
-        }, 650)
+        handler.removeCallbacksAndMessages(null)
+        v.play(mode) {
+            handler.postDelayed({
+                v.animate()
+                    .alpha(0f)
+                    .setDuration(200)
+                    .withEndAction { removeLock() }
+                    .start()
+            }, 150)
+        }
     }
 
     private fun removeLock() {
         handler.removeCallbacksAndMessages(null)
         unlocking = false
-        lockView?.let {
+        pill?.let {
             it.animate().cancel()
+            it.stop()
             try {
                 wm.removeView(it)
             } catch (_: Exception) {
             }
         }
-        lockView = null
+        pill = null
+    }
+
+    companion object {
+        private const val CHANNEL_ID = "padlock_keepalive"
     }
 }
