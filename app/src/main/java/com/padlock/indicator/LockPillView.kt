@@ -18,13 +18,15 @@ import kotlin.math.sin
 
 /**
  * Pill with a padlock in the middle.
- * IDLE: pill grows, face scan plays on the left, fingerprint plays on the right, pill shrinks away.
+ * LOCKED: just the closed padlock.
+ * IDLE: pill grows, face scan on the left, fingerprint on the right, pill shrinks away.
  * UNLOCK_BIO: pill returns with a green fingerprint pulse while the lock opens.
+ * UNLOCK_FACE: pill returns with a green face pulse while the lock opens.
  * UNLOCK_PIN: lock just opens.
  */
 class LockPillView(context: Context) : View(context) {
 
-    enum class Mode { LOCKED, IDLE, UNLOCK_BIO, UNLOCK_PIN }
+    enum class Mode { LOCKED, IDLE, UNLOCK_BIO, UNLOCK_FACE, UNLOCK_PIN }
 
     private val d = resources.displayMetrics.density
     private fun dp(v: Float) = v * d
@@ -104,8 +106,9 @@ class LockPillView(context: Context) : View(context) {
         invalidate()
 
         val dur = when (newMode) {
-            Mode.IDLE -> 2800f
+            Mode.IDLE -> 2100f
             Mode.UNLOCK_BIO -> 1000f
+            Mode.UNLOCK_FACE -> 1000f
             Mode.UNLOCK_PIN -> 520f
             Mode.LOCKED -> 0f
         }
@@ -157,15 +160,22 @@ class LockPillView(context: Context) : View(context) {
         when (mode) {
             Mode.LOCKED -> {}
             Mode.IDLE -> {
-                pillFrac = ease(seg(0f, 350f)) * (1f - ease(seg(2300f, 2800f)))
-                glyphA = ease(seg(250f, 450f)) * (1f - ease(seg(2200f, 2500f)))
-                faceP = seg(350f, 1150f)
-                fpP = seg(1150f, 1950f)
+                pillFrac = ease(seg(0f, 220f)) * (1f - ease(seg(1750f, 2100f)))
+                glyphA = ease(seg(150f, 320f)) * (1f - ease(seg(1650f, 1900f)))
+                faceP = seg(220f, 850f)
+                fpP = seg(850f, 1450f)
             }
             Mode.UNLOCK_BIO -> {
                 pillFrac = ease(seg(0f, 250f)) * (1f - ease(seg(750f, 1000f)))
                 glyphA = ease(seg(100f, 300f)) * (1f - ease(seg(700f, 900f)))
                 fpP = seg(0f, 250f)
+                success = seg(250f, 650f)
+                open = backOut(seg(300f, 700f))
+            }
+            Mode.UNLOCK_FACE -> {
+                pillFrac = ease(seg(0f, 250f)) * (1f - ease(seg(750f, 1000f)))
+                glyphA = ease(seg(100f, 300f)) * (1f - ease(seg(700f, 900f)))
+                faceP = seg(0f, 250f)
                 success = seg(250f, 650f)
                 open = backOut(seg(300f, 700f))
             }
@@ -189,8 +199,12 @@ class LockPillView(context: Context) : View(context) {
         if (glyphA > 0f) {
             val left = cx - pw / 2f
             val right = cx + pw / 2f
-            if (mode == Mode.IDLE) drawFace(canvas, left + dp(20f), cy, faceP, glyphA)
-            drawFingerprint(canvas, right - dp(20f), cy, fpP, success, glyphA)
+            if (mode == Mode.IDLE || mode == Mode.UNLOCK_FACE) {
+                drawFace(canvas, left + dp(20f), cy, faceP, success, glyphA)
+            }
+            if (mode == Mode.IDLE || mode == Mode.UNLOCK_BIO) {
+                drawFingerprint(canvas, right - dp(20f), cy, fpP, success, glyphA)
+            }
         }
 
         // padlock, always centered and drawn on top
@@ -206,8 +220,8 @@ class LockPillView(context: Context) : View(context) {
         canvas.restore()
     }
 
-    private fun drawFace(c: Canvas, cx: Float, cy: Float, p: Float, a: Float) {
-        glyph.color = Color.WHITE
+    private fun drawFace(c: Canvas, cx: Float, cy: Float, p: Float, success: Float, a: Float) {
+        glyph.color = argb.evaluate(success, Color.WHITE, green) as Int
         glyph.alpha = (255 * a).toInt()
 
         val settle = ease(p / 0.4f)
@@ -238,6 +252,12 @@ class LockPillView(context: Context) : View(context) {
             val y = cy - r + 2f * r * ease(q)
             glyph.alpha = (140 * a * sin(PI * q).toFloat()).toInt()
             c.drawLine(cx - r + dp(1f), y, cx + r - dp(1f), y, glyph)
+        }
+
+        if (success > 0f && success < 1f) {
+            ringPaint.color = green
+            ringPaint.alpha = (200 * (1f - success) * a).toInt()
+            c.drawCircle(cx, cy, dp(11f) + dp(6f) * success, ringPaint)
         }
     }
 
