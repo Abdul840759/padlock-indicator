@@ -18,6 +18,8 @@ import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import android.view.Gravity
+import android.view.MotionEvent
+import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 
@@ -30,15 +32,39 @@ class LockIndicatorService : AccessibilityService() {
     private val handler = Handler(Looper.getMainLooper())
 
     private var pill: LockPillView? = null
+    private var touchView: View? = null
     private var unlocking = false
     private var registered = false
+
+    // unlock-method signals, reset on every screen-on
+    @Volatile
+    private var touches = 0
+    private var typingSeen = false
+    private var screenLocked = false
+
+    private val hints = listOf(
+        "numpadkey", "passwordtextview", "lockpatternview", "edittext",
+        "keyguardpin", "keyguardpassword", "keyguardpattern"
+    )
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
-                Intent.ACTION_SCREEN_ON -> if (km.isKeyguardLocked) showLock()
-                Intent.ACTION_USER_PRESENT -> playUnlock()
-                Intent.ACTION_SCREEN_OFF -> removeLock()
+                Intent.ACTION_SCREEN_ON -> {
+                    touches = 0
+                    typingSeen = false
+                    screenLocked = km.isKeyguardLocked
+                    if (screenLocked) showLock()
+                }
+                Intent.ACTION_USER_PRESENT -> {
+                    screenLocked = false
+                    // small wait so a late admin callback can still arrive
+                    handler.postDelayed({ playUnlock() }, 250)
+                }
+                Intent.ACTION_SCREEN_OFF -> {
+                    screenLocked = false
+                    removeLock()
+                }
             }
         }
     }
@@ -64,10 +90,30 @@ class LockIndicatorService : AccessibilityService() {
             registered = true
         }
 
-        if (km.isKeyguardLocked) showLock()
+        screenLocked = km.isKeyguardLocked
+        if (screenLocked) showLock()
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        val e = event ?: return
+        if (!screenLocked) return
+
+        val cls = e.className?.toString() ?: ""
+        val lower = cls.lowercase()
+        val hint = hints.any { lower.contains(it) }
+        val type = e.eventType
+
+        if (type != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED || hint) {
+            Log.d("PadlockEv", AccessibilityEvent.eventTypeToString(type) + " cls=" + cls)
+        }
+
+        if (hint &&
+            type != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+            type != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+        ) {
+            typingSeen = true
+        }
+    }
 
     override fun onInterrupt() {}
 
@@ -99,10 +145,38 @@ class LockIndicatorService : AccessibilityService() {
         }
     }
 
+    // 1px invisible window that counts taps anywhere else on the screen
+    @Suppress("DEPRECATION")
+    private fun addTouchWatcher() {
+        if (touchView != null) return
+        val v = View(this)
+        v.setOnTouchListener { _, ev ->
+            if (ev.actionMasked == MotionEvent.ACTION_OUTSIDE) touches++
+            false
+        }
+        val p = WindowManager.LayoutParams(
+            1, 1,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH or
+                WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED,
+            PixelFormat.TRANSPARENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+        }
+        try {
+            wm.addView(v, p)
+            touchView = v
+        } catch (_: Exception) {
+        }
+    }
+
     @Suppress("DEPRECATION")
     private fun showLock() {
         handler.removeCallbacksAndMessages(null)
         unlocking = false
+        addTouchWatcher()
 
         pill?.let {
             it.animate().cancel()
@@ -143,15 +217,22 @@ class LockIndicatorService : AccessibilityService() {
         if (unlocking) return
         unlocking = true
 
-        val adminOn = dpm.isAdminActive(adminName)
-        val viaPassword = adminOn &&
-            SystemClock.elapsedRealtime() - UnlockInfo.lastPasswordAt < 4000L
-        val mode = if (adminOn && !viaPassword) {
-            LockPillView.Mode.UNLOCK_BIO
-        } else {
+        val now = SystemClock.elapsedRealtime()
+        val byCallback = dpm.isAdminActive(adminName) &&
+            now - UnlockInfo.lastPasswordAt < 6000L
+        val byTyping = typingSeen
+        val byTouches = touches >= TOUCH_THRESHOLD
+        val credential = byCallback || byTyping || byTouches
+
+        val mode = if (credential) {
             LockPillView.Mode.UNLOCK_PIN
+        } else {
+            LockPillView.Mode.UNLOCK_BIO
         }
-        Log.d("Padlock", "unlock: admin=$adminOn password=$viaPassword mode=$mode")
+        Log.d(
+            "Padlock",
+            "unlock: callback=$byCallback typing=$byTyping touches=$touches -> $mode"
+        )
 
         handler.removeCallbacksAndMessages(null)
         v.play(mode) {
@@ -177,9 +258,17 @@ class LockIndicatorService : AccessibilityService() {
             }
         }
         pill = null
+        touchView?.let {
+            try {
+                wm.removeView(it)
+            } catch (_: Exception) {
+            }
+        }
+        touchView = null
     }
 
     companion object {
         private const val CHANNEL_ID = "padlock_keepalive"
+        private const val TOUCH_THRESHOLD = 3
     }
 }
