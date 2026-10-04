@@ -12,24 +12,32 @@ import android.provider.Settings
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.SeekBar
+import android.widget.Switch
 import android.widget.TextView
+import android.widget.Toast
 
 class MainActivity : Activity() {
 
     private lateinit var status: TextView
+    private lateinit var prefs: Prefs
     private val adminName by lazy { ComponentName(this, LockDeviceAdmin::class.java) }
+
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+    private fun svc() = LockIndicatorService.instance
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val pad = (20 * resources.displayMetrics.density).toInt()
+        prefs = Prefs(this)
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(pad, pad, pad, pad)
+            setPadding(dp(20), dp(20), dp(20), dp(40))
         }
+
         status = TextView(this).apply {
             textSize = 15f
-            setPadding(0, 0, 0, pad)
+            setPadding(0, 0, 0, dp(12))
         }
         root.addView(status)
 
@@ -46,6 +54,29 @@ class MainActivity : Activity() {
                 )
             )
         }
+
+        addTitle(root, "Customize")
+        addSlider(root, "Position from top", 80, prefs.yOffset + 10, { "${it - 10} dp" }) {
+            prefs.yOffset = it - 10
+        }
+        addSlider(root, "Size", 80, prefs.sizePct - 70, { "${it + 70}%" }) {
+            prefs.sizePct = it + 70
+        }
+        addSlider(root, "Animation speed", 100, prefs.speedPct - 50, { "${it + 50}%" }) {
+            prefs.speedPct = it + 50
+        }
+        addSwitch(root, "Face scan animation", prefs.showFace) { prefs.showFace = it }
+        addSwitch(root, "Fingerprint animation", prefs.showFingerprint) { prefs.showFingerprint = it }
+        addSwitch(root, "Haptic tick on unlock", prefs.haptics) { prefs.haptics = it }
+        addSwitch(root, "Charging pill", prefs.charging) { prefs.charging = it }
+        addSwitch(root, "Adapt lock color to wallpaper", prefs.autoColor) { prefs.autoColor = it }
+
+        addTitle(root, "Preview on this screen")
+        addPreview(root, "Lock screen sequence", LockPillView.Mode.IDLE)
+        addPreview(root, "Unlock: fingerprint", LockPillView.Mode.UNLOCK_BIO)
+        addPreview(root, "Unlock: face", LockPillView.Mode.UNLOCK_FACE)
+        addPreview(root, "Unlock: PIN / password", LockPillView.Mode.UNLOCK_PIN)
+        addPreview(root, "Charging pill", LockPillView.Mode.CHARGE)
 
         setContentView(ScrollView(this).apply { addView(root) })
     }
@@ -65,12 +96,81 @@ class MainActivity : Activity() {
             "Battery unrestricted: " + yn(pm.isIgnoringBatteryOptimizations(packageName))
     }
 
+    private fun addTitle(parent: LinearLayout, text: String) {
+        parent.addView(TextView(this).apply {
+            this.text = text
+            textSize = 18f
+            setPadding(0, dp(24), 0, dp(4))
+        })
+    }
+
     private fun addButton(parent: LinearLayout, label: String, action: () -> Unit) {
         parent.addView(Button(this).apply {
             text = label
             isAllCaps = false
             setOnClickListener { action() }
         })
+    }
+
+    private fun addPreview(parent: LinearLayout, label: String, mode: LockPillView.Mode) {
+        addButton(parent, label) {
+            val s = svc()
+            if (s == null) {
+                Toast.makeText(this, "Turn on the accessibility service first", Toast.LENGTH_SHORT).show()
+            } else {
+                s.preview(mode)
+            }
+        }
+    }
+
+    private fun addSwitch(parent: LinearLayout, name: String, start: Boolean, onChange: (Boolean) -> Unit) {
+        parent.addView(Switch(this).apply {
+            text = name
+            isChecked = start
+            setPadding(0, dp(8), 0, dp(8))
+            setOnCheckedChangeListener { _, checked ->
+                onChange(checked)
+                svc()?.onSettingsChanged()
+            }
+        })
+    }
+
+    private fun addSlider(
+        parent: LinearLayout,
+        name: String,
+        maxValue: Int,
+        start: Int,
+        fmt: (Int) -> String,
+        onChange: (Int) -> Unit
+    ) {
+        val label = TextView(this).apply {
+            textSize = 14f
+            text = name + ": " + fmt(start)
+            setPadding(0, dp(12), 0, 0)
+        }
+        val bar = SeekBar(this).apply {
+            this.max = maxValue
+            progress = start
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar, p: Int, fromUser: Boolean) {
+                    label.text = name + ": " + fmt(p)
+                    if (fromUser) {
+                        onChange(p)
+                        svc()?.onSettingsChanged()
+                    }
+                }
+
+                override fun onStartTrackingTouch(sb: SeekBar) {
+                    svc()?.showStatic()
+                }
+
+                override fun onStopTrackingTouch(sb: SeekBar) {
+                    svc()?.preview(LockPillView.Mode.IDLE)
+                }
+            })
+        }
+        parent.addView(label)
+        parent.addView(bar)
     }
 
     private fun requestAdmin() {

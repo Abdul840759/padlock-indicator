@@ -10,6 +10,7 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
+import android.graphics.Typeface
 import android.view.View
 import android.view.animation.LinearInterpolator
 import kotlin.math.PI
@@ -19,19 +20,20 @@ import kotlin.math.sin
 /**
  * Pill with a padlock in the middle.
  * LOCKED: just the closed padlock.
- * IDLE: pill grows, face scan on the left, fingerprint on the right, pill shrinks away.
- * UNLOCK_BIO: pill returns with a green fingerprint pulse while the lock opens.
- * UNLOCK_FACE: pill returns with a green face pulse while the lock opens.
+ * IDLE: pill grows, face scan left, fingerprint right, pill shrinks away.
+ * UNLOCK_BIO / UNLOCK_FACE: pill returns with a green pulse while the lock opens.
  * UNLOCK_PIN: lock just opens.
+ * CHARGE: bolt (or low-battery icon) left, percentage right, padlock or battery ring in the middle.
  */
 class LockPillView(context: Context) : View(context) {
 
-    enum class Mode { LOCKED, IDLE, UNLOCK_BIO, UNLOCK_FACE, UNLOCK_PIN }
+    enum class Mode { LOCKED, IDLE, UNLOCK_BIO, UNLOCK_FACE, UNLOCK_PIN, CHARGE }
 
     private val d = resources.displayMetrics.density
     private fun dp(v: Float) = v * d
 
     private val green = 0xFF34C759.toInt()
+    private val orange = 0xFFFF9F0A.toInt()
     private val argb = ArgbEvaluator()
     private val rect = RectF()
 
@@ -49,6 +51,20 @@ class LockPillView(context: Context) : View(context) {
         style = Paint.Style.STROKE
         strokeWidth = 1.5f * d
     }
+    private val gauge = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2f * d
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+    }
+    private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        textSize = 11f * d
+        typeface = Typeface.DEFAULT_BOLD
+        textAlign = Paint.Align.CENTER
+    }
     private val bodyPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.WHITE
         style = Paint.Style.FILL
@@ -62,6 +78,32 @@ class LockPillView(context: Context) : View(context) {
         setShadowLayer(2f * d, 0f, 0.5f * d, 0x55000000)
     }
 
+    // settings pushed in by the service
+    var scale = 1f
+        set(v) {
+            if (field != v) {
+                field = v
+                requestLayout()
+                invalidate()
+            }
+        }
+    var speed = 1f
+    var showFace = true
+    var showFp = true
+    var chargeLevel = 0
+    var chargeLow = false
+    var lockVisible = true
+    var adaptiveColor = Color.WHITE
+        set(v) {
+            if (field != v) {
+                field = v
+                val sh = if (Color.luminance(v) > 0.5f) 0x55000000 else 0x66FFFFFF
+                bodyPaint.setShadowLayer(2f * d, 0f, 0.5f * d, sh)
+                shacklePaint.setShadowLayer(2f * d, 0f, 0.5f * d, sh)
+                invalidate()
+            }
+        }
+
     private val shackle = Path().apply {
         moveTo(5f * d, 16f * d)
         lineTo(5f * d, 12f * d)
@@ -69,6 +111,16 @@ class LockPillView(context: Context) : View(context) {
         lineTo(13f * d, 16f * d)
     }
     private val body = RectF(2f * d, 16f * d, 16f * d, 28f * d)
+
+    private val bolt = Path().apply {
+        moveTo(1.5f * d, -7f * d)
+        lineTo(-4f * d, 0.5f * d)
+        lineTo(-0.5f * d, 0.5f * d)
+        lineTo(-1.5f * d, 7f * d)
+        lineTo(4f * d, -1f * d)
+        lineTo(0.5f * d, -1f * d)
+        close()
+    }
 
     // radius dp, start angle, sweep
     private val arcs = arrayOf(
@@ -87,7 +139,7 @@ class LockPillView(context: Context) : View(context) {
     }
 
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
-        setMeasuredDimension(dp(130f).toInt(), dp(36f).toInt())
+        setMeasuredDimension((dp(130f) * scale).toInt(), (dp(36f) * scale).toInt())
     }
 
     fun stop() {
@@ -105,17 +157,18 @@ class LockPillView(context: Context) : View(context) {
         t = 0f
         invalidate()
 
-        val dur = when (newMode) {
+        val base = when (newMode) {
             Mode.IDLE -> 2100f
             Mode.UNLOCK_BIO -> 1000f
             Mode.UNLOCK_FACE -> 1000f
             Mode.UNLOCK_PIN -> 520f
+            Mode.CHARGE -> 2600f
             Mode.LOCKED -> 0f
         }
-        if (dur == 0f) return
+        if (base == 0f) return
 
-        anim = ValueAnimator.ofFloat(0f, dur).apply {
-            duration = dur.toLong()
+        anim = ValueAnimator.ofFloat(0f, base).apply {
+            duration = (base / speed).toLong().coerceAtLeast(1L)
             interpolator = LinearInterpolator()
             addUpdateListener {
                 t = it.animatedValue as Float
@@ -156,6 +209,8 @@ class LockPillView(context: Context) : View(context) {
         var fpP = 0f
         var success = 0f
         var open = 0f
+        var chargeP = 0f
+        var pop = 0f
 
         when (mode) {
             Mode.LOCKED -> {}
@@ -182,13 +237,22 @@ class LockPillView(context: Context) : View(context) {
             Mode.UNLOCK_PIN -> {
                 open = backOut(seg(0f, 450f))
             }
+            Mode.CHARGE -> {
+                pillFrac = ease(seg(0f, 250f)) * (1f - ease(seg(2200f, 2600f)))
+                glyphA = ease(seg(120f, 300f)) * (1f - ease(seg(2100f, 2400f)))
+                chargeP = seg(250f, 900f)
+                pop = backOut(seg(150f, 450f))
+            }
         }
 
-        val w = width.toFloat()
-        val h = height.toFloat()
+        val w = dp(130f)
+        val h = dp(36f)
         val cx = w / 2f
         val cy = h / 2f
         val pw = dp(34f) + (dp(116f) - dp(34f)) * pillFrac
+
+        canvas.save()
+        canvas.scale(scale, scale)
 
         if (pillFrac > 0f) {
             pillPaint.alpha = (230 * min(1f, pillFrac * 3f)).toInt()
@@ -199,24 +263,37 @@ class LockPillView(context: Context) : View(context) {
         if (glyphA > 0f) {
             val left = cx - pw / 2f
             val right = cx + pw / 2f
-            if (mode == Mode.IDLE || mode == Mode.UNLOCK_FACE) {
-                drawFace(canvas, left + dp(20f), cy, faceP, success, glyphA)
-            }
-            if (mode == Mode.IDLE || mode == Mode.UNLOCK_BIO) {
-                drawFingerprint(canvas, right - dp(20f), cy, fpP, success, glyphA)
+            when (mode) {
+                Mode.IDLE -> {
+                    if (showFace) drawFace(canvas, left + dp(20f), cy, faceP, success, glyphA)
+                    if (showFp) drawFingerprint(canvas, right - dp(20f), cy, fpP, success, glyphA)
+                }
+                Mode.UNLOCK_FACE -> drawFace(canvas, left + dp(20f), cy, faceP, success, glyphA)
+                Mode.UNLOCK_BIO -> drawFingerprint(canvas, right - dp(20f), cy, fpP, success, glyphA)
+                Mode.CHARGE -> drawCharge(canvas, left + dp(22f), right - dp(24f), cx, cy, chargeP, pop, glyphA)
+                else -> {}
             }
         }
 
-        // padlock, always centered and drawn on top
-        canvas.save()
-        canvas.translate(cx, cy)
-        canvas.translate(-9f * d, -18f * d)
-        canvas.save()
-        canvas.translate(0f, -2f * d * open)
-        canvas.rotate(28f * open, 13f * d, 16f * d)
-        canvas.drawPath(shackle, shacklePaint)
-        canvas.restore()
-        canvas.drawRoundRect(body, 3f * d, 3f * d, bodyPaint)
+        // padlock: always centered and on top, hidden only by the charging ring
+        if (mode != Mode.CHARGE || lockVisible) {
+            val mix = min(1f, pillFrac * 3f)
+            val lockCol = argb.evaluate(mix, adaptiveColor, Color.WHITE) as Int
+            bodyPaint.color = lockCol
+            shacklePaint.color = lockCol
+
+            canvas.save()
+            canvas.translate(cx, cy)
+            canvas.translate(-9f * d, -18f * d)
+            canvas.save()
+            canvas.translate(0f, -2f * d * open)
+            canvas.rotate(28f * open, 13f * d, 16f * d)
+            canvas.drawPath(shackle, shacklePaint)
+            canvas.restore()
+            canvas.drawRoundRect(body, 3f * d, 3f * d, bodyPaint)
+            canvas.restore()
+        }
+
         canvas.restore()
     }
 
@@ -275,6 +352,51 @@ class LockPillView(context: Context) : View(context) {
             ringPaint.color = green
             ringPaint.alpha = (200 * (1f - success) * a).toInt()
             c.drawCircle(cx, cy, dp(10f) + dp(7f) * success, ringPaint)
+        }
+    }
+
+    private fun drawCharge(
+        c: Canvas, lx: Float, rx: Float, cx: Float, cy: Float,
+        p: Float, pop: Float, a: Float
+    ) {
+        val accent = if (chargeLow) orange else green
+
+        // left icon: bolt when charging, small battery when low
+        c.save()
+        c.translate(lx, cy)
+        c.scale(pop, pop)
+        fill.color = accent
+        fill.alpha = (255 * a).toInt()
+        if (!chargeLow) {
+            c.drawPath(bolt, fill)
+        } else {
+            glyph.color = accent
+            glyph.alpha = (255 * a).toInt()
+            rect.set(-7f * d, -4f * d, 6f * d, 4f * d)
+            c.drawRoundRect(rect, 1.5f * d, 1.5f * d, glyph)
+            rect.set(6f * d, -1.5f * d, 8f * d, 1.5f * d)
+            c.drawRect(rect, fill)
+            rect.set(-5.5f * d, -2.5f * d, (-5.5f + 10f * (chargeLevel / 100f)) * d, 2.5f * d)
+            c.drawRect(rect, fill)
+        }
+        c.restore()
+
+        // right text: percentage counting up
+        val shown = (chargeLevel * p).toInt()
+        textPaint.alpha = (255 * a).toInt()
+        val fm = textPaint.fontMetrics
+        c.drawText("$shown%", rx, cy - (fm.ascent + fm.descent) / 2f, textPaint)
+
+        // middle: battery ring when the padlock is not shown
+        if (!lockVisible) {
+            val rr = dp(8f)
+            gauge.color = Color.WHITE
+            gauge.alpha = (70 * a).toInt()
+            c.drawCircle(cx, cy, rr, gauge)
+            gauge.color = accent
+            gauge.alpha = (255 * a).toInt()
+            rect.set(cx - rr, cy - rr, cx + rr, cy + rr)
+            c.drawArc(rect, -90f, 360f * (chargeLevel / 100f) * p, false, gauge)
         }
     }
 }

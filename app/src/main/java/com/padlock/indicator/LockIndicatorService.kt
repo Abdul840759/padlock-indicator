@@ -5,21 +5,26 @@ import android.app.KeyguardManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.WallpaperManager
 import android.app.admin.DevicePolicyManager
 import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.graphics.Color
 import android.graphics.PixelFormat
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.hardware.display.DisplayManager
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.util.Log
 import android.view.Display
 import android.view.Gravity
@@ -35,6 +40,7 @@ class LockIndicatorService : AccessibilityService() {
     private lateinit var dpm: DevicePolicyManager
     private lateinit var cm: CameraManager
     private lateinit var dm: DisplayManager
+    private lateinit var prefs: Prefs
     private val adminName by lazy { ComponentName(this, LockDeviceAdmin::class.java) }
     private val handler = Handler(Looper.getMainLooper())
 
@@ -47,8 +53,16 @@ class LockIndicatorService : AccessibilityService() {
     private var awake = false
     private var screenLocked = false
     private var unlocking = false
+    private var idleRunning = false
     private var wakeAt = 0L
     private var presentAt = 0L
+
+    private var wallpaperLight = false
+
+    // charging pill bookkeeping
+    private var pendingCharge = false
+    private var pendingLow = false
+    private var chargeConnectedAt = 0L
 
     // unlock-method signals, reset on every wake
     @Volatile
@@ -80,6 +94,8 @@ class LockIndicatorService : AccessibilityService() {
                     awake = false
                     screenLocked = false
                 }
+                Intent.ACTION_POWER_CONNECTED -> onPower(false)
+                Intent.ACTION_BATTERY_LOW -> onPower(true)
             }
         }
     }
@@ -121,6 +137,8 @@ class LockIndicatorService : AccessibilityService() {
     }
 
     override fun onServiceConnected() {
+        instance = this
+        prefs = Prefs(this)
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         km = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
         dpm = getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
@@ -134,6 +152,8 @@ class LockIndicatorService : AccessibilityService() {
                 addAction(Intent.ACTION_SCREEN_ON)
                 addAction(Intent.ACTION_SCREEN_OFF)
                 addAction(Intent.ACTION_USER_PRESENT)
+                addAction(Intent.ACTION_POWER_CONNECTED)
+                addAction(Intent.ACTION_BATTERY_LOW)
             }
             if (Build.VERSION.SDK_INT >= 33) {
                 registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
@@ -153,6 +173,7 @@ class LockIndicatorService : AccessibilityService() {
             registered = true
         }
 
+        refreshWallpaperTone()
         // load the overlay window now so it is ready before the first wake
         ensureWindow()
 
@@ -185,6 +206,7 @@ class LockIndicatorService : AccessibilityService() {
     override fun onInterrupt() {}
 
     override fun onDestroy() {
+        instance = null
         if (registered) {
             try {
                 unregisterReceiver(receiver)
@@ -235,6 +257,103 @@ class LockIndicatorService : AccessibilityService() {
         }
     }
 
+    // ---------- settings, called from the app screen ----------
+
+    fun onSettingsChanged() {
+        pill?.let { applySettings(it) }
+    }
+
+    // keeps the closed padlock on screen while a slider is being dragged
+    fun showStatic() {
+        if (screenLocked) return
+        val v = ensureWindow() ?: return
+        applySettings(v)
+        handler.removeCallbacksAndMessages(null)
+        idleRunning = false
+        v.animate().cancel()
+        v.alpha = 1f
+        v.lockVisible = true
+        v.visibility = View.VISIBLE
+        v.play(LockPillView.Mode.LOCKED)
+    }
+
+    // plays any animation over the current screen, then hides it
+    fun preview(mode: LockPillView.Mode) {
+        if (screenLocked) return
+        val v = ensureWindow() ?: return
+        applySettings(v)
+        handler.removeCallbacksAndMessages(null)
+        idleRunning = false
+        v.animate().cancel()
+        v.alpha = 1f
+        v.lockVisible = mode != LockPillView.Mode.CHARGE
+        v.chargeLevel = batteryLevel()
+        v.chargeLow = false
+        v.visibility = View.VISIBLE
+        v.play(mode) {
+            handler.postDelayed({
+                v.animate()
+                    .alpha(0f)
+                    .setDuration(200)
+                    .withEndAction { hideLock() }
+                    .start()
+            }, 400)
+        }
+    }
+
+    private fun applySettings(v: LockPillView) {
+        v.scale = prefs.sizePct / 100f
+        v.speed = prefs.speedPct / 100f
+        v.showFace = prefs.showFace
+        v.showFp = prefs.showFingerprint
+        v.adaptiveColor = if (prefs.autoColor && wallpaperLight) 0xFF1C1C1E.toInt() else Color.WHITE
+        updatePosition(v)
+    }
+
+    private fun statusBarHeight(): Int {
+        val id = resources.getIdentifier("status_bar_height", "dimen", "android")
+        return if (id > 0) resources.getDimensionPixelSize(id) else 0
+    }
+
+    private fun targetY(): Int =
+        statusBarHeight() + (prefs.yOffset * resources.displayMetrics.density).toInt()
+
+    private fun updatePosition(v: LockPillView) {
+        val lp = v.layoutParams as? WindowManager.LayoutParams ?: return
+        val y = targetY()
+        if (lp.y != y) {
+            lp.y = y
+            try {
+                wm.updateViewLayout(v, lp)
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun refreshWallpaperTone() {
+        if (Build.VERSION.SDK_INT < 27) return
+        try {
+            val wmgr = WallpaperManager.getInstance(this)
+            val colors = wmgr.getWallpaperColors(WallpaperManager.FLAG_LOCK)
+                ?: wmgr.getWallpaperColors(WallpaperManager.FLAG_SYSTEM)
+            if (colors != null) {
+                wallpaperLight = if (Build.VERSION.SDK_INT >= 29) {
+                    (colors.colorHints and android.app.WallpaperColors.HINT_SUPPORTS_DARK_TEXT) != 0
+                } else {
+                    Color.luminance(colors.primaryColor.toArgb()) > 0.6f
+                }
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun batteryLevel(): Int {
+        val bi = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED)) ?: return 0
+        val level = bi.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+        val scale = bi.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
+        return if (level >= 0 && scale > 0) level * 100 / scale else 0
+    }
+
     // ---------- wake / sleep ----------
 
     private fun onWake(source: String) {
@@ -248,7 +367,20 @@ class LockIndicatorService : AccessibilityService() {
         camFreeAt = 0L
         screenLocked = km.isKeyguardLocked
         Log.d("Padlock", "wake via $source locked=$screenLocked")
-        if (screenLocked) showLock() else hideLock()
+
+        // plugged in a moment ago while the screen was off
+        if (prefs.charging && wakeAt - chargeConnectedAt < 4000L) {
+            pendingCharge = true
+            pendingLow = false
+            chargeConnectedAt = 0L
+        }
+
+        if (screenLocked) {
+            showLock()
+        } else {
+            hideLock()
+            runPendingCharge()
+        }
     }
 
     // display is off: park the closed padlock in the window so it is there on the first frame of the next wake
@@ -256,10 +388,15 @@ class LockIndicatorService : AccessibilityService() {
         awake = false
         screenLocked = false
         unlocking = false
+        idleRunning = false
+        pendingCharge = false
         handler.removeCallbacksAndMessages(null)
+        refreshWallpaperTone()
         val v = ensureWindow() ?: return
+        applySettings(v)
         v.animate().cancel()
         v.alpha = 1f
+        v.lockVisible = true
         v.play(LockPillView.Mode.LOCKED)
         v.visibility = View.VISIBLE
     }
@@ -275,10 +412,6 @@ class LockIndicatorService : AccessibilityService() {
             }
         }
 
-        val density = resources.displayMetrics.density
-        val sbId = resources.getIdentifier("status_bar_height", "dimen", "android")
-        val statusBar = if (sbId > 0) resources.getDimensionPixelSize(sbId) else 0
-
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -290,11 +423,12 @@ class LockIndicatorService : AccessibilityService() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-            y = statusBar + (2 * density).toInt()
+            y = targetY()
         }
 
         val view = LockPillView(this)
         view.visibility = View.INVISIBLE
+        applySettings(view)
         return try {
             wm.addView(view, params)
             pill = view
@@ -341,19 +475,76 @@ class LockIndicatorService : AccessibilityService() {
         handler.removeCallbacksAndMessages(null)
         unlocking = false
         val v = ensureWindow() ?: return
+        applySettings(v)
         v.animate().cancel()
         v.alpha = 1f
+        v.lockVisible = true
         v.visibility = View.VISIBLE
-        v.play(LockPillView.Mode.IDLE)
+        if (!prefs.showFace && !prefs.showFingerprint) {
+            idleRunning = false
+            v.play(LockPillView.Mode.LOCKED)
+            runPendingCharge()
+        } else {
+            idleRunning = true
+            v.play(LockPillView.Mode.IDLE) {
+                idleRunning = false
+                runPendingCharge()
+            }
+        }
     }
 
     private fun hideLock() {
         handler.removeCallbacksAndMessages(null)
+        idleRunning = false
         pill?.let {
             it.animate().cancel()
             it.stop()
             it.alpha = 1f
             it.visibility = View.INVISIBLE
+        }
+    }
+
+    // ---------- charging pill ----------
+
+    private fun onPower(low: Boolean) {
+        if (!prefs.charging) return
+        if (awake) {
+            showCharge(low)
+        } else if (!low) {
+            chargeConnectedAt = SystemClock.elapsedRealtime()
+        }
+    }
+
+    private fun runPendingCharge() {
+        if (pendingCharge) {
+            pendingCharge = false
+            showCharge(pendingLow)
+        }
+    }
+
+    private fun showCharge(low: Boolean) {
+        if (!awake || unlocking) return
+        if (idleRunning) {
+            pendingCharge = true
+            pendingLow = low
+            return
+        }
+        val v = ensureWindow() ?: return
+        applySettings(v)
+        handler.removeCallbacksAndMessages(null)
+        v.animate().cancel()
+        v.alpha = 1f
+        v.chargeLevel = batteryLevel()
+        v.chargeLow = low
+        v.lockVisible = screenLocked
+        v.visibility = View.VISIBLE
+        v.play(LockPillView.Mode.CHARGE) {
+            if (screenLocked) {
+                v.lockVisible = true
+                v.play(LockPillView.Mode.LOCKED)
+            } else {
+                hideLock()
+            }
         }
     }
 
@@ -363,6 +554,8 @@ class LockIndicatorService : AccessibilityService() {
         val v = pill ?: return
         if (v.visibility != View.VISIBLE || unlocking) return
         unlocking = true
+        idleRunning = false
+        pendingCharge = false
 
         val adminOn = dpm.isAdminActive(adminName)
         val sinceCb = presentAt - UnlockInfo.lastPasswordAt
@@ -391,6 +584,14 @@ class LockIndicatorService : AccessibilityService() {
         )
 
         handler.removeCallbacksAndMessages(null)
+        applySettings(v)
+        v.lockVisible = true
+
+        if (prefs.haptics) {
+            val strong = mode != LockPillView.Mode.UNLOCK_PIN
+            handler.postDelayed({ tick(strong) }, (300f / (prefs.speedPct / 100f)).toLong())
+        }
+
         v.play(mode) {
             handler.postDelayed({
                 v.animate()
@@ -402,7 +603,21 @@ class LockIndicatorService : AccessibilityService() {
         }
     }
 
+    private fun tick(strong: Boolean) {
+        try {
+            val vib = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+            if (!vib.hasVibrator()) return
+            val ms = if (strong) 22L else 12L
+            val amp = if (strong) 160 else 90
+            vib.vibrate(VibrationEffect.createOneShot(ms, amp))
+        } catch (_: Exception) {
+        }
+    }
+
     companion object {
+        @Volatile
+        var instance: LockIndicatorService? = null
+
         private const val CHANNEL_ID = "padlock_keepalive"
         private const val TOUCH_THRESHOLD = 3
         private const val FACE_WINDOW_MS = 1500L
