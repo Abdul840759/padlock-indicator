@@ -41,8 +41,11 @@ class LockIndicatorService : AccessibilityService() {
     private lateinit var cm: CameraManager
     private lateinit var dm: DisplayManager
     private lateinit var prefs: Prefs
+    private lateinit var stats: Stats
     private val adminName by lazy { ComponentName(this, LockDeviceAdmin::class.java) }
     private val handler = Handler(Looper.getMainLooper())
+    // separate queue so UI cleanups never cancel the face-result check
+    private val checkHandler = Handler(Looper.getMainLooper())
 
     private var pill: LockPillView? = null
     private var pillAddedAt = 0L
@@ -56,6 +59,7 @@ class LockIndicatorService : AccessibilityService() {
     private var idleRunning = false
     private var wakeAt = 0L
     private var presentAt = 0L
+    private var lastSleepAt = 0L
 
     private var wallpaperLight = false
 
@@ -68,12 +72,16 @@ class LockIndicatorService : AccessibilityService() {
     @Volatile
     private var touches = 0
     private var typingSeen = false
+    private var faceVerified = false
+    private var faceTextSeen = false
+    private var lastFaceFailAt = 0L
+    private val lastFail = HashMap<String, Long>()
 
-    // front camera tracking (face unlock opens it)
+    // front camera tracking: always on, never reset on wake (face unlock can finish before the wake is noticed)
     private val frontIds = HashSet<String>()
     private var camBusy = false
-    private var camBusyAt = 0L
-    private var camFreeAt = 0L
+    private var camSessionStart = 0L
+    private var camSessionEnd = 0L
 
     private val hints = listOf(
         "numpadkey", "passwordtextview", "lockpatternview", "edittext",
@@ -87,7 +95,7 @@ class LockIndicatorService : AccessibilityService() {
                 Intent.ACTION_USER_PRESENT -> {
                     presentAt = SystemClock.elapsedRealtime()
                     screenLocked = false
-                    // small wait so a late admin callback or camera release can still arrive
+                    // small wait so a late camera release or admin callback can still arrive
                     handler.postDelayed({ playUnlock() }, 250)
                 }
                 Intent.ACTION_SCREEN_OFF -> {
@@ -118,27 +126,34 @@ class LockIndicatorService : AccessibilityService() {
     private val camCb = object : CameraManager.AvailabilityCallback() {
         override fun onCameraUnavailable(cameraId: String) {
             if (cameraId !in frontIds) return
-            camBusy = true
             val now = SystemClock.elapsedRealtime()
-            if (awake && screenLocked) {
-                camBusyAt = now
-                camFreeAt = 0L
+            if (!camBusy) {
+                camSessionStart = now
+                camSessionEnd = 0L
             }
-            Log.d("PadlockCam", "front camera busy at +" + (now - wakeAt) + "ms")
+            camBusy = true
+            Log.d("PadlockCam", "front busy at wake+" + (now - wakeAt) + "ms awake=" + awake)
         }
 
         override fun onCameraAvailable(cameraId: String) {
             if (cameraId !in frontIds) return
-            camBusy = false
             val now = SystemClock.elapsedRealtime()
-            if (awake && screenLocked && camBusyAt != 0L) camFreeAt = now
-            Log.d("PadlockCam", "front camera free at +" + (now - wakeAt) + "ms")
+            val wasBusy = camBusy
+            camBusy = false
+            if (!wasBusy) return
+            camSessionEnd = now
+            Log.d(
+                "PadlockCam",
+                "front free after " + (now - camSessionStart) + "ms awake=" + awake + " locked=" + screenLocked
+            )
+            if (awake && screenLocked) scheduleFaceCheck(camSessionStart, now)
         }
     }
 
     override fun onServiceConnected() {
         instance = this
         prefs = Prefs(this)
+        stats = Stats(this)
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         km = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
         dpm = getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
@@ -201,6 +216,12 @@ class LockIndicatorService : AccessibilityService() {
         ) {
             typingSeen = true
         }
+
+        // read lockscreen messages, but never anything from the PIN / password entry
+        if (!hint) {
+            val text = e.text?.joinToString(" ")?.lowercase() ?: ""
+            if (text.isNotBlank()) handleText(text)
+        }
     }
 
     override fun onInterrupt() {}
@@ -223,6 +244,7 @@ class LockIndicatorService : AccessibilityService() {
             registered = false
         }
         handler.removeCallbacksAndMessages(null)
+        checkHandler.removeCallbacksAndMessages(null)
         pill?.let {
             it.stop()
             try {
@@ -255,6 +277,83 @@ class LockIndicatorService : AccessibilityService() {
             startForeground(1, n)
         } catch (_: Exception) {
         }
+    }
+
+    // ---------- lockscreen text, face / fingerprint / PIN failures ----------
+
+    private fun handleText(text: String) {
+        Log.d("PadlockEv", "txt=" + text.take(80))
+        val notRecognized = text.contains("not recogni") || text.contains("couldn't recogni") ||
+            text.contains("can't recogni") || text.contains("didn't recogni") ||
+            text.contains("try again") || text.contains("unable")
+        when {
+            text.contains("face") -> {
+                if (notRecognized) {
+                    onFaceFail("text")
+                } else if (text.contains("unlocked by face") || text.contains("face unlocked") ||
+                    text.contains("face recognized") || text.contains("recognized face")
+                ) {
+                    faceTextSeen = true
+                }
+            }
+            text.contains("finger") -> {
+                if (notRecognized || text.contains("not match")) recordFail("FP_FAIL", text.take(30))
+            }
+            text.contains("wrong") || text.contains("incorrect") -> {
+                recordFail("PIN_FAIL", text.take(30))
+            }
+        }
+    }
+
+    private fun recordFail(kind: String, note: String) {
+        val now = SystemClock.elapsedRealtime()
+        if (now - (lastFail[kind] ?: 0L) < 1500L) return
+        lastFail[kind] = now
+        stats.add(kind, 0L, note.replace(',', ' ').replace('\n', ' '))
+    }
+
+    private fun onFaceFail(source: String) {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastFaceFailAt < 3000L) return
+        lastFaceFailAt = now
+        Log.d("Padlock", "face not recognized ($source)")
+        stats.add("FACE_FAIL", 0L, "src=$source")
+        shakeFail()
+    }
+
+    // a face scan ended: if the phone is still locked shortly after, it did not recognize the face
+    private fun scheduleFaceCheck(start: Long, end: Long) {
+        if (end - start < 500L) return // too short to be a real scan
+        checkHandler.removeCallbacksAndMessages(null)
+        checkHandler.postDelayed({ checkFaceResult(start, end) }, 1300L)
+    }
+
+    private fun checkFaceResult(start: Long, end: Long) {
+        if (camSessionStart != start || camSessionEnd != end) return // newer session started
+        if (!awake || !screenLocked || unlocking) return
+        val deviceLocked = km.isDeviceLocked
+        Log.d("Padlock", "face scan ended, still on lockscreen: deviceLocked=$deviceLocked")
+        if (!deviceLocked) {
+            // face worked, the lockscreen is only waiting for a swipe
+            faceVerified = true
+            return
+        }
+        onFaceFail("camera")
+    }
+
+    private fun shakeFail() {
+        if (!prefs.failShake) return
+        val v = pill ?: return
+        if (!awake || !screenLocked || unlocking || v.visibility != View.VISIBLE) return
+        idleRunning = false
+        v.animate().cancel()
+        v.alpha = 1f
+        v.lockVisible = true
+        v.play(LockPillView.Mode.FAIL) {
+            v.play(LockPillView.Mode.LOCKED)
+            runPendingCharge()
+        }
+        if (prefs.haptics) buzzFail()
     }
 
     // ---------- settings, called from the app screen ----------
@@ -363,8 +462,9 @@ class LockIndicatorService : AccessibilityService() {
         wakeAt = SystemClock.elapsedRealtime()
         touches = 0
         typingSeen = false
-        camBusyAt = if (camBusy) wakeAt else 0L
-        camFreeAt = 0L
+        faceVerified = false
+        faceTextSeen = false
+        checkHandler.removeCallbacksAndMessages(null)
         screenLocked = km.isKeyguardLocked
         Log.d("Padlock", "wake via $source locked=$screenLocked")
 
@@ -390,7 +490,9 @@ class LockIndicatorService : AccessibilityService() {
         unlocking = false
         idleRunning = false
         pendingCharge = false
+        lastSleepAt = SystemClock.elapsedRealtime()
         handler.removeCallbacksAndMessages(null)
+        checkHandler.removeCallbacksAndMessages(null)
         refreshWallpaperTone()
         val v = ensureWindow() ?: return
         applySettings(v)
@@ -551,11 +653,11 @@ class LockIndicatorService : AccessibilityService() {
     // ---------- unlock ----------
 
     private fun playUnlock() {
-        val v = pill ?: return
-        if (v.visibility != View.VISIBLE || unlocking) return
+        if (unlocking) return
         unlocking = true
         idleRunning = false
         pendingCharge = false
+        checkHandler.removeCallbacksAndMessages(null)
 
         val adminOn = dpm.isAdminActive(adminName)
         val sinceCb = presentAt - UnlockInfo.lastPasswordAt
@@ -564,24 +666,42 @@ class LockIndicatorService : AccessibilityService() {
         val byTouches = touches >= TOUCH_THRESHOLD
         val credential = byCallback || byTyping || byTouches
 
-        // face unlock: front camera was used after wake and released just before the unlock
-        val camGap = if (camFreeAt != 0L) presentAt - camFreeAt else Long.MIN_VALUE
-        val byFace = !credential && camBusyAt != 0L && camFreeAt != 0L &&
-            camGap in (-FACE_SLACK_MS)..FACE_WINDOW_MS
+        // face unlock: a front-camera scan happened since the screen went off and ended just before the unlock,
+        // or the lockscreen already confirmed the face and only waited for a swipe
+        val sessionOk = camSessionStart != 0L &&
+            camSessionStart >= lastSleepAt - 300L &&
+            presentAt - camSessionStart <= 10000L
+        val ended = camSessionEnd != 0L && camSessionEnd >= camSessionStart
+        val freedInTime = ended &&
+            camSessionEnd <= presentAt + FACE_SLACK_MS &&
+            presentAt - camSessionEnd <= FACE_WINDOW_MS
+        val byFace = !credential && (faceVerified || faceTextSeen || (sessionOk && freedInTime))
 
         val mode = when {
             credential -> LockPillView.Mode.UNLOCK_PIN
             byFace -> LockPillView.Mode.UNLOCK_FACE
             else -> LockPillView.Mode.UNLOCK_BIO
         }
+        val kind = when (mode) {
+            LockPillView.Mode.UNLOCK_PIN -> "PIN"
+            LockPillView.Mode.UNLOCK_FACE -> "FACE"
+            else -> "FINGERPRINT"
+        }
 
-        val camBusyMs = if (camBusyAt != 0L) camBusyAt - wakeAt else -1L
-        val camFreeMs = if (camFreeAt != 0L) camGap else -1L
+        val camStartRel = if (camSessionStart != 0L) camSessionStart - wakeAt else -1L
+        val camEndRel = if (camSessionEnd != 0L) camSessionEnd - presentAt else 0L
         Log.d(
             "Padlock",
             "unlock: callback=$byCallback typing=$byTyping touches=$touches " +
-                "camBusyAfterWake=${camBusyMs}ms camFreeBeforeUnlock=${camFreeMs}ms -> $mode"
+                "camSession=$sessionOk freedInTime=$freedInTime camStart=${camStartRel}ms " +
+                "camEndVsUnlock=${camEndRel}ms faceVerified=$faceVerified faceText=$faceTextSeen -> $mode"
         )
+
+        val latency = (presentAt - wakeAt).coerceAtLeast(0L)
+        stats.add(kind, latency, "t=$touches;ty=$byTyping;cam=$sessionOk/$freedInTime;fv=$faceVerified")
+
+        val v = pill ?: return
+        if (v.visibility != View.VISIBLE) return
 
         handler.removeCallbacksAndMessages(null)
         applySettings(v)
@@ -610,6 +730,22 @@ class LockIndicatorService : AccessibilityService() {
             val ms = if (strong) 22L else 12L
             val amp = if (strong) 160 else 90
             vib.vibrate(VibrationEffect.createOneShot(ms, amp))
+        } catch (_: Exception) {
+        }
+    }
+
+    // double buzz, like a "no" nod
+    private fun buzzFail() {
+        try {
+            val vib = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+            if (!vib.hasVibrator()) return
+            vib.vibrate(
+                VibrationEffect.createWaveform(
+                    longArrayOf(0, 25, 70, 25),
+                    intArrayOf(0, 180, 0, 180),
+                    -1
+                )
+            )
         } catch (_: Exception) {
         }
     }

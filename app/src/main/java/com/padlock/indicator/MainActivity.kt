@@ -55,6 +55,11 @@ class MainActivity : Activity() {
             )
         }
 
+        addTitle(root, "Insights")
+        addButton(root, "Unlock stats") {
+            startActivity(Intent(this, StatsActivity::class.java))
+        }
+
         addTitle(root, "Customize")
         addSlider(root, "Position from top", 80, prefs.yOffset + 10, { "${it - 10} dp" }) {
             prefs.yOffset = it - 10
@@ -67,6 +72,7 @@ class MainActivity : Activity() {
         }
         addSwitch(root, "Face scan animation", prefs.showFace) { prefs.showFace = it }
         addSwitch(root, "Fingerprint animation", prefs.showFingerprint) { prefs.showFingerprint = it }
+        addSwitch(root, "Shake when face isn't recognized", prefs.failShake) { prefs.failShake = it }
         addSwitch(root, "Haptic tick on unlock", prefs.haptics) { prefs.haptics = it }
         addSwitch(root, "Charging pill", prefs.charging) { prefs.charging = it }
         addSwitch(root, "Adapt lock color to wallpaper", prefs.autoColor) { prefs.autoColor = it }
@@ -76,6 +82,7 @@ class MainActivity : Activity() {
         addPreview(root, "Unlock: fingerprint", LockPillView.Mode.UNLOCK_BIO)
         addPreview(root, "Unlock: face", LockPillView.Mode.UNLOCK_FACE)
         addPreview(root, "Unlock: PIN / password", LockPillView.Mode.UNLOCK_PIN)
+        addPreview(root, "Face not recognized", LockPillView.Mode.FAIL)
         addPreview(root, "Charging pill", LockPillView.Mode.CHARGE)
 
         setContentView(ScrollView(this).apply { addView(root) })

@@ -24,16 +24,18 @@ import kotlin.math.sin
  * UNLOCK_BIO / UNLOCK_FACE: pill returns with a green pulse while the lock opens.
  * UNLOCK_PIN: lock just opens.
  * CHARGE: bolt (or low-battery icon) left, percentage right, padlock or battery ring in the middle.
+ * FAIL: red face glyph appears and everything shakes sideways (face not recognized).
  */
 class LockPillView(context: Context) : View(context) {
 
-    enum class Mode { LOCKED, IDLE, UNLOCK_BIO, UNLOCK_FACE, UNLOCK_PIN, CHARGE }
+    enum class Mode { LOCKED, IDLE, UNLOCK_BIO, UNLOCK_FACE, UNLOCK_PIN, CHARGE, FAIL }
 
     private val d = resources.displayMetrics.density
     private fun dp(v: Float) = v * d
 
     private val green = 0xFF34C759.toInt()
     private val orange = 0xFFFF9F0A.toInt()
+    private val red = 0xFFFF453A.toInt()
     private val argb = ArgbEvaluator()
     private val rect = RectF()
 
@@ -163,6 +165,7 @@ class LockPillView(context: Context) : View(context) {
             Mode.UNLOCK_FACE -> 1000f
             Mode.UNLOCK_PIN -> 520f
             Mode.CHARGE -> 2600f
+            Mode.FAIL -> 700f
             Mode.LOCKED -> 0f
         }
         if (base == 0f) return
@@ -208,9 +211,11 @@ class LockPillView(context: Context) : View(context) {
         var faceP = 0f
         var fpP = 0f
         var success = 0f
+        var bad = 0f
         var open = 0f
         var chargeP = 0f
         var pop = 0f
+        var shakeX = 0f
 
         when (mode) {
             Mode.LOCKED -> {}
@@ -243,6 +248,14 @@ class LockPillView(context: Context) : View(context) {
                 chargeP = seg(250f, 900f)
                 pop = backOut(seg(150f, 450f))
             }
+            Mode.FAIL -> {
+                pillFrac = ease(seg(0f, 150f)) * (1f - ease(seg(520f, 700f)))
+                glyphA = ease(seg(40f, 180f)) * (1f - ease(seg(480f, 650f)))
+                faceP = 1f
+                bad = ease(seg(40f, 180f))
+                val q = seg(60f, 700f)
+                shakeX = sin(q * 2f * PI.toFloat() * 3.5f) * (1f - q) * dp(5f)
+            }
         }
 
         val w = dp(130f)
@@ -253,6 +266,7 @@ class LockPillView(context: Context) : View(context) {
 
         canvas.save()
         canvas.scale(scale, scale)
+        canvas.translate(shakeX, 0f)
 
         if (pillFrac > 0f) {
             pillPaint.alpha = (230 * min(1f, pillFrac * 3f)).toInt()
@@ -265,10 +279,11 @@ class LockPillView(context: Context) : View(context) {
             val right = cx + pw / 2f
             when (mode) {
                 Mode.IDLE -> {
-                    if (showFace) drawFace(canvas, left + dp(20f), cy, faceP, success, glyphA)
+                    if (showFace) drawFace(canvas, left + dp(20f), cy, faceP, success, bad, glyphA)
                     if (showFp) drawFingerprint(canvas, right - dp(20f), cy, fpP, success, glyphA)
                 }
-                Mode.UNLOCK_FACE -> drawFace(canvas, left + dp(20f), cy, faceP, success, glyphA)
+                Mode.UNLOCK_FACE -> drawFace(canvas, left + dp(20f), cy, faceP, success, bad, glyphA)
+                Mode.FAIL -> drawFace(canvas, left + dp(20f), cy, faceP, success, bad, glyphA)
                 Mode.UNLOCK_BIO -> drawFingerprint(canvas, right - dp(20f), cy, fpP, success, glyphA)
                 Mode.CHARGE -> drawCharge(canvas, left + dp(22f), right - dp(24f), cx, cy, chargeP, pop, glyphA)
                 else -> {}
@@ -297,8 +312,12 @@ class LockPillView(context: Context) : View(context) {
         canvas.restore()
     }
 
-    private fun drawFace(c: Canvas, cx: Float, cy: Float, p: Float, success: Float, a: Float) {
-        glyph.color = argb.evaluate(success, Color.WHITE, green) as Int
+    private fun drawFace(
+        c: Canvas, cx: Float, cy: Float, p: Float,
+        success: Float, bad: Float, a: Float
+    ) {
+        val base = argb.evaluate(success, Color.WHITE, green) as Int
+        glyph.color = argb.evaluate(bad, base, red) as Int
         glyph.alpha = (255 * a).toInt()
 
         val settle = ease(p / 0.4f)

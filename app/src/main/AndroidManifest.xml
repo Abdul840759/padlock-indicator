@@ -20,6 +20,11 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".StatsActivity"
+            android:exported="false"
+            android:label="Unlock stats" />
+
         <service
             android:name=".LockIndicatorService"
             android:exported="false"

@@ -41,4 +41,8 @@ class Prefs(context: Context) {
     var autoColor: Boolean
         get() = sp.getBoolean("autocolor", true)
         set(v) = sp.edit().putBoolean("autocolor", v).apply()
+
+    var failShake: Boolean
+        get() = sp.getBoolean("failshake", true)
+        set(v) = sp.edit().putBoolean("failshake", v).apply()
 }
